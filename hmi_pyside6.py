@@ -7,12 +7,13 @@ import cv2
 import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
     QFormLayout,
-    QGroupBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -21,6 +22,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QTabWidget,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -38,6 +40,35 @@ from app import (
 from calibration_window import CalibrationWindow
 
 
+class CollapsibleSection(QWidget):
+    def __init__(self, title: str, content_widget: QWidget, expanded: bool = True) -> None:
+        super().__init__()
+        self.toggle_button = QToolButton(text=title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(expanded)
+        self.toggle_button.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.toggle_button.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self.toggle_button.clicked.connect(self._on_toggled)
+
+        self.content_widget = content_widget
+        self.content_widget.setVisible(expanded)
+
+        divider = QFrame()
+        divider.setFrameShape(QFrame.HLine)
+        divider.setFrameShadow(QFrame.Sunken)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self.toggle_button)
+        layout.addWidget(divider)
+        layout.addWidget(self.content_widget)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self.toggle_button.setArrowType(Qt.DownArrow if checked else Qt.RightArrow)
+        self.content_widget.setVisible(checked)
+
+
 class LaserPrototypeQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -50,6 +81,9 @@ class LaserPrototypeQt(QMainWindow):
         self.raw_depths = None
         self.cloud = None
         self.layered_cloud = None
+        self.display_depths = None
+        self.filtered_cloud = None
+        self.filtered_layered_cloud = None
         self.sequence_paths: list[str] = []
         self.calibration = None
         self.caliper_mode = False
@@ -95,8 +129,9 @@ class LaserPrototypeQt(QMainWindow):
         right_tabs.addTab(self.cloud_canvas, "3D Cloud")
 
         # Simplified workflow controls.
-        workflow_box = QGroupBox("Workflow")
-        workflow_layout = QVBoxLayout(workflow_box)
+        workflow_panel = QWidget()
+        workflow_layout = QVBoxLayout(workflow_panel)
+        workflow_layout.setContentsMargins(0, 0, 0, 0)
         for label, cb in [
             ("Load Image", self.load_image),
             ("Process Current Image", self.process_current),
@@ -106,8 +141,11 @@ class LaserPrototypeQt(QMainWindow):
             b = QPushButton(label)
             b.clicked.connect(cb)
             workflow_layout.addWidget(b)
-        left_layout.addWidget(workflow_box)
+        left_layout.addWidget(CollapsibleSection("Workflow", workflow_panel, expanded=True))
 
+        status_panel = QWidget()
+        status_layout = QVBoxLayout(status_panel)
+        status_layout.setContentsMargins(0, 0, 0, 0)
         self.path_label = QLabel("No image loaded")
         self.path_label.setWordWrap(True)
         self.seq_label = QLabel("No sequence loaded")
@@ -121,26 +159,36 @@ class LaserPrototypeQt(QMainWindow):
         self.cloud_point_size = QLineEdit("3.0")
         self.apply_cloud_view_btn = QPushButton("Apply 3D Cloud Z Scale")
         self.apply_cloud_view_btn.clicked.connect(self.refresh_profile_view)
+        self.roi_inputs: dict[str, QLineEdit] = {}
+        self.filter_status_label = QLabel("Filter: inactive")
+        self.apply_filter_btn = QPushButton("Apply ROI/Z Filter")
+        self.apply_filter_btn.clicked.connect(self.apply_filters)
+        self.clear_filter_btn = QPushButton("Clear ROI/Z Filter")
+        self.clear_filter_btn.clicked.connect(self.clear_filters)
         self.status_label = QLabel("Ready")
         self.status_label.setWordWrap(True)
-        left_layout.addWidget(self.path_label)
-        left_layout.addWidget(self.seq_label)
-        left_layout.addWidget(self.calibration_label)
-        left_layout.addWidget(self.depth_hover_label)
-        left_layout.addWidget(self.caliper_label)
-        left_layout.addWidget(QLabel("Profile visual Z scale (display only)"))
-        left_layout.addWidget(self.profile_visual_scale)
-        left_layout.addWidget(self.apply_profile_view_btn)
-        left_layout.addWidget(QLabel("3D cloud visual Z scale (display only)"))
-        left_layout.addWidget(self.cloud_visual_z_scale)
-        left_layout.addWidget(QLabel("3D cloud point size"))
-        left_layout.addWidget(self.cloud_point_size)
-        left_layout.addWidget(self.apply_cloud_view_btn)
-        left_layout.addWidget(self.status_label)
+        status_layout.addWidget(self.path_label)
+        status_layout.addWidget(self.seq_label)
+        status_layout.addWidget(self.calibration_label)
+        status_layout.addWidget(self.depth_hover_label)
+        status_layout.addWidget(self.caliper_label)
+        status_layout.addWidget(QLabel("Profile visual Z scale (display only)"))
+        status_layout.addWidget(self.profile_visual_scale)
+        status_layout.addWidget(self.apply_profile_view_btn)
+        status_layout.addWidget(QLabel("3D cloud visual Z scale (display only)"))
+        status_layout.addWidget(self.cloud_visual_z_scale)
+        status_layout.addWidget(QLabel("3D cloud point size"))
+        status_layout.addWidget(self.cloud_point_size)
+        status_layout.addWidget(self.apply_cloud_view_btn)
+        status_layout.addWidget(self.filter_status_label)
+        status_layout.addWidget(self.apply_filter_btn)
+        status_layout.addWidget(self.clear_filter_btn)
+        status_layout.addWidget(self.status_label)
+        left_layout.addWidget(CollapsibleSection("Status + View", status_panel, expanded=True))
 
         # Processing params
-        params_box = QGroupBox("Parameters")
-        params_form = QFormLayout(params_box)
+        params_panel = QWidget()
+        params_form = QFormLayout(params_panel)
         defaults = {
             "h_min": "50", "h_max": "80", "s_min": "80", "s_max": "255", "v_min": "80", "v_max": "255",
             "blur_kernel": "5", "median_kernel": "0", "morph_open": "0", "morph_close": "0",
@@ -154,10 +202,25 @@ class LaserPrototypeQt(QMainWindow):
         self.scan_axis = QComboBox()
         self.scan_axis.addItems(["y", "x"])
         params_form.addRow("scan_axis", self.scan_axis)
-        left_layout.addWidget(params_box)
+        left_layout.addWidget(CollapsibleSection("Parameters", params_panel, expanded=False))
 
-        process_box = QGroupBox("Sequence Process")
-        process_layout = QVBoxLayout(process_box)
+        filter_panel = QWidget()
+        filter_form = QFormLayout(filter_panel)
+        filter_defaults = {
+            "x_min": "", "x_max": "",
+            "y_min": "", "y_max": "",
+            "z_min": "", "z_max": "",
+        }
+        for key, value in filter_defaults.items():
+            entry = QLineEdit(value)
+            entry.setPlaceholderText("disabled")
+            self.roi_inputs[key] = entry
+            filter_form.addRow(key, entry)
+        left_layout.addWidget(CollapsibleSection("ROI / Z Filter (mm)", filter_panel, expanded=True))
+
+        process_panel = QWidget()
+        process_layout = QVBoxLayout(process_panel)
+        process_layout.setContentsMargins(0, 0, 0, 0)
         for label, cb in [
             ("Load Sequence Images", self.load_sequence_images),
             ("Build Layered Cloud", self.build_layered_cloud),
@@ -169,7 +232,7 @@ class LaserPrototypeQt(QMainWindow):
             b = QPushButton(label)
             b.clicked.connect(cb)
             process_layout.addWidget(b)
-        left_layout.addWidget(process_box)
+        left_layout.addWidget(CollapsibleSection("Sequence Process", process_panel, expanded=False))
         left_layout.addStretch(1)
 
     def _f(self, key: str) -> float:
@@ -191,6 +254,100 @@ class LaserPrototypeQt(QMainWindow):
             self._i("min_blob_area"),
             self._i("centroid_smooth_window"),
         )
+
+    def _optional_float(self, entry: QLineEdit) -> float | None:
+        text = entry.text().strip()
+        if not text:
+            return None
+        return float(text)
+
+    def _roi_limits(self) -> dict[str, float | None]:
+        return {
+            key: self._optional_float(widget)
+            for key, widget in self.roi_inputs.items()
+        }
+
+    def _apply_cloud_roi_filter(self, cloud: np.ndarray) -> np.ndarray:
+        if cloud is None or cloud.size == 0:
+            return np.zeros((0, 3), dtype=np.float32)
+        limits = self._roi_limits()
+        mask = np.isfinite(cloud).all(axis=1)
+        x = cloud[:, 0]
+        y = cloud[:, 1]
+        z = cloud[:, 2]
+        if limits["x_min"] is not None:
+            mask &= x >= float(limits["x_min"])
+        if limits["x_max"] is not None:
+            mask &= x <= float(limits["x_max"])
+        if limits["y_min"] is not None:
+            mask &= y >= float(limits["y_min"])
+        if limits["y_max"] is not None:
+            mask &= y <= float(limits["y_max"])
+        if limits["z_min"] is not None:
+            mask &= z >= float(limits["z_min"])
+        if limits["z_max"] is not None:
+            mask &= z <= float(limits["z_max"])
+        return cloud[mask]
+
+    def _apply_profile_roi_filter(self, depths: np.ndarray | None) -> np.ndarray | None:
+        if depths is None:
+            return None
+        out = depths.astype(np.float64, copy=True)
+        limits = self._roi_limits()
+        mm_per_pixel = self._f("mm_per_pixel")
+        cols_mm = np.arange(out.shape[0], dtype=np.float64) * mm_per_pixel
+        if limits["x_min"] is not None:
+            out[cols_mm < float(limits["x_min"])] = np.nan
+        if limits["x_max"] is not None:
+            out[cols_mm > float(limits["x_max"])] = np.nan
+        if limits["z_min"] is not None:
+            out[out < float(limits["z_min"])] = np.nan
+        if limits["z_max"] is not None:
+            out[out > float(limits["z_max"])] = np.nan
+        y_min = limits["y_min"]
+        y_max = limits["y_max"]
+        if (y_min is not None and 0.0 < float(y_min)) or (y_max is not None and 0.0 > float(y_max)):
+            out[:] = np.nan
+        return out
+
+    def _active_raw_cloud(self) -> np.ndarray:
+        if self.layered_cloud is not None:
+            return self.layered_cloud
+        if self.cloud is not None:
+            return self.cloud
+        return np.zeros((0, 3), dtype=np.float32)
+
+    def _active_filtered_cloud(self) -> np.ndarray:
+        if self.layered_cloud is not None and self.filtered_layered_cloud is not None:
+            return self.filtered_layered_cloud
+        if self.cloud is not None and self.filtered_cloud is not None:
+            return self.filtered_cloud
+        return np.zeros((0, 3), dtype=np.float32)
+
+    def apply_filters(self) -> None:
+        try:
+            self.display_depths = self._apply_profile_roi_filter(self.depths)
+            self.filtered_cloud = self._apply_cloud_roi_filter(self.cloud)
+            self.filtered_layered_cloud = self._apply_cloud_roi_filter(self.layered_cloud)
+            raw_active = self._active_raw_cloud()
+            filtered_active = self._active_filtered_cloud()
+            self._update_plots(filtered_active)
+            self.filter_status_label.setText(
+                f"Filter active: {filtered_active.shape[0]}/{raw_active.shape[0]} points shown"
+            )
+            self.status_label.setText("ROI/Z filters applied.")
+        except Exception as e:
+            QMessageBox.critical(self, "Filter Error", str(e))
+
+    def clear_filters(self) -> None:
+        for entry in self.roi_inputs.values():
+            entry.clear()
+        self.display_depths = self.depths
+        self.filtered_cloud = self.cloud
+        self.filtered_layered_cloud = self.layered_cloud
+        self._update_plots(self._active_raw_cloud())
+        self.filter_status_label.setText("Filter: inactive")
+        self.status_label.setText("ROI/Z filters cleared.")
 
     def _process_depth(self, bgr: np.ndarray):
         cents, mask = self._extract(bgr)
@@ -228,7 +385,7 @@ class LaserPrototypeQt(QMainWindow):
             self.depths = depths
             self.cloud = build_single_line_cloud(depths, self._f("mm_per_pixel"))
             self._update_preview(mask, overlay)
-            self._update_plots(self.cloud)
+            self.apply_filters()
             self.status_label.setText(f"Processed: valid {int(np.isfinite(depths).sum())}/{len(depths)}, points {self.cloud.shape[0]}")
         except Exception as e:
             QMessageBox.critical(self, "Process Error", str(e))
@@ -260,7 +417,7 @@ class LaserPrototypeQt(QMainWindow):
         self.layered_cloud = build_layered_cloud_from_depth_rows(
             depth_rows, self._f("mm_per_pixel"), self._f("frame_step_mm"), self.scan_axis.currentText()
         )
-        self._update_plots(self.layered_cloud)
+        self.apply_filters()
         self.status_label.setText(f"Layered cloud: frames={len(depth_rows)}, unreadable={bad}, points={self.layered_cloud.shape[0]}")
 
     def load_cal_json(self) -> None:
@@ -288,8 +445,9 @@ class LaserPrototypeQt(QMainWindow):
             return
         out, _ = QFileDialog.getSaveFileName(self, "Save cloud CSV", "cloud.csv", "CSV (*.csv)")
         if out:
-            np.savetxt(Path(out), self.cloud, delimiter=",", header="x_mm,y_mm,z_mm", comments="")
-            self.status_label.setText(f"Saved cloud CSV: {out}")
+            cloud_to_save = self.filtered_cloud if self.filtered_cloud is not None else self.cloud
+            np.savetxt(Path(out), cloud_to_save, delimiter=",", header="x_mm,y_mm,z_mm", comments="")
+            self.status_label.setText(f"Saved cloud CSV (filtered view): {out}")
 
     def save_layered_cloud_csv(self) -> None:
         if self.layered_cloud is None or self.layered_cloud.size == 0:
@@ -297,8 +455,9 @@ class LaserPrototypeQt(QMainWindow):
             return
         out, _ = QFileDialog.getSaveFileName(self, "Save layered cloud CSV", "layered_cloud.csv", "CSV (*.csv)")
         if out:
-            np.savetxt(Path(out), self.layered_cloud, delimiter=",", header="x_mm,y_mm,z_mm", comments="")
-            self.status_label.setText(f"Saved layered cloud CSV: {out}")
+            cloud_to_save = self.filtered_layered_cloud if self.filtered_layered_cloud is not None else self.layered_cloud
+            np.savetxt(Path(out), cloud_to_save, delimiter=",", header="x_mm,y_mm,z_mm", comments="")
+            self.status_label.setText(f"Saved layered cloud CSV (filtered view): {out}")
 
     def open_calibration_window(self) -> None:
         if self.calibration_window is None:
@@ -348,9 +507,10 @@ class LaserPrototypeQt(QMainWindow):
             visual_scale = 1.0
         if visual_scale <= 0:
             visual_scale = 1.0
-        if self.depths is not None:
-            cols = np.arange(self.depths.shape[0], dtype=np.int32)
-            self.ax_profile.plot(cols, self.depths, linewidth=1.0, color="tab:blue")
+        profile_depths = self.display_depths if self.display_depths is not None else self.depths
+        if profile_depths is not None:
+            cols = np.arange(profile_depths.shape[0], dtype=np.int32)
+            self.ax_profile.plot(cols, profile_depths, linewidth=1.0, color="tab:blue")
             self.ax_profile.grid(True, alpha=0.3)
             # Display-only vertical exaggeration; underlying values remain unchanged.
             self.ax_profile.set_aspect(1.0 / visual_scale, adjustable="datalim")
@@ -395,21 +555,21 @@ class LaserPrototypeQt(QMainWindow):
         self.cloud_canvas.draw_idle()
 
     def _on_profile_hover(self, event) -> None:
-        if event.inaxes != self.ax_profile or self.depths is None or event.xdata is None:
+        if event.inaxes != self.ax_profile or self.display_depths is None or event.xdata is None:
             self.depth_hover_label.setText("Depth @ cursor: -")
             return
         idx = int(round(event.xdata))
-        if idx < 0 or idx >= len(self.depths):
+        if idx < 0 or idx >= len(self.display_depths):
             self.depth_hover_label.setText("Depth @ cursor: -")
             return
-        z = float(self.depths[idx])
+        z = float(self.display_depths[idx])
         if not np.isfinite(z):
             self.depth_hover_label.setText(f"Depth @ cursor: col={idx}, z=nan")
             return
         self.depth_hover_label.setText(f"Depth @ cursor: col={idx}, z={z:.4f} mm")
 
     def start_profile_calipers(self) -> None:
-        if self.depths is None:
+        if self.display_depths is None:
             QMessageBox.warning(self, "No Profile", "Process an image first.")
             return
         self.caliper_mode = True
@@ -422,17 +582,13 @@ class LaserPrototypeQt(QMainWindow):
         self.caliper_points = []
         self.caliper_line = None
         self.caliper_label.setText("Calipers: off")
-        cloud = (
-            self.layered_cloud
-            if (self.layered_cloud is not None and self.layered_cloud.size > 0)
-            else (self.cloud if self.cloud is not None else np.zeros((0, 3), dtype=np.float32))
-        )
+        cloud = self._active_filtered_cloud()
         self._update_plots(cloud)
 
     def _on_profile_click(self, event) -> None:
         if not self.caliper_mode:
             return
-        if self.depths is None or event.inaxes != self.ax_profile or event.xdata is None or event.ydata is None:
+        if self.display_depths is None or event.inaxes != self.ax_profile or event.xdata is None or event.ydata is None:
             return
         self.caliper_points.append((float(event.xdata), float(event.ydata)))
         if len(self.caliper_points) < 2:
@@ -444,10 +600,10 @@ class LaserPrototypeQt(QMainWindow):
         dz_mm = abs(p2[1] - p1[1])
         p1_col = int(round(p1[0]))
         p2_col = int(round(p2[0]))
-        p1_col = max(0, min(p1_col, len(self.depths) - 1))
-        p2_col = max(0, min(p2_col, len(self.depths) - 1))
-        z1 = float(self.depths[p1_col])
-        z2 = float(self.depths[p2_col])
+        p1_col = max(0, min(p1_col, len(self.display_depths) - 1))
+        p2_col = max(0, min(p2_col, len(self.display_depths) - 1))
+        z1 = float(self.display_depths[p1_col])
+        z2 = float(self.display_depths[p2_col])
         dx_mm = dx_cols * self._f("mm_per_pixel")
         p2p_mm = float(np.hypot(dx_mm, dz_mm))
         self.caliper_label.setText(
@@ -455,19 +611,11 @@ class LaserPrototypeQt(QMainWindow):
         )
         self.caliper_mode = False
         self.caliper_points = []
-        cloud = (
-            self.layered_cloud
-            if (self.layered_cloud is not None and self.layered_cloud.size > 0)
-            else (self.cloud if self.cloud is not None else np.zeros((0, 3), dtype=np.float32))
-        )
+        cloud = self._active_filtered_cloud()
         self._update_plots(cloud)
 
     def refresh_profile_view(self) -> None:
-        cloud = (
-            self.layered_cloud
-            if (self.layered_cloud is not None and self.layered_cloud.size > 0)
-            else (self.cloud if self.cloud is not None else np.zeros((0, 3), dtype=np.float32))
-        )
+        cloud = self._active_filtered_cloud()
         self._update_plots(cloud)
         self.status_label.setText("Profile/3D view scale updated (display only).")
 

@@ -160,7 +160,9 @@ class LaserPrototypeQt(QMainWindow):
         self.apply_cloud_view_btn = QPushButton("Apply 3D Cloud Z Scale")
         self.apply_cloud_view_btn.clicked.connect(self.refresh_profile_view)
         self.roi_inputs: dict[str, QLineEdit] = {}
+        self.manual_positions_input: QLineEdit | None = None
         self.filter_status_label = QLabel("Filter: inactive")
+        self.sequence_spacing_label = QLabel("Sequence spacing: uniform step")
         self.apply_filter_btn = QPushButton("Apply ROI/Z Filter")
         self.apply_filter_btn.clicked.connect(self.apply_filters)
         self.clear_filter_btn = QPushButton("Clear ROI/Z Filter")
@@ -221,6 +223,18 @@ class LaserPrototypeQt(QMainWindow):
         process_panel = QWidget()
         process_layout = QVBoxLayout(process_panel)
         process_layout.setContentsMargins(0, 0, 0, 0)
+        self.sequence_spacing_mode = QComboBox()
+        self.sequence_spacing_mode.addItems(["Uniform step (frame_step_mm)", "Manual frame positions (mm)"])
+        process_layout.addWidget(QLabel("Sequence spacing mode"))
+        process_layout.addWidget(self.sequence_spacing_mode)
+        self.manual_positions_input = QLineEdit("")
+        self.manual_positions_input.setPlaceholderText("0, 1.0, 2.1, 3.1, ...")
+        process_layout.addWidget(QLabel("Manual frame positions [mm] (comma-separated, one per image)"))
+        process_layout.addWidget(self.manual_positions_input)
+        self.autofill_positions_btn = QPushButton("Auto-fill Manual Positions from frame_step_mm")
+        self.autofill_positions_btn.clicked.connect(self.autofill_manual_positions)
+        process_layout.addWidget(self.autofill_positions_btn)
+        process_layout.addWidget(self.sequence_spacing_label)
         for label, cb in [
             ("Load Sequence Images", self.load_sequence_images),
             ("Build Layered Cloud", self.build_layered_cloud),
@@ -324,6 +338,75 @@ class LaserPrototypeQt(QMainWindow):
             return self.filtered_cloud
         return np.zeros((0, 3), dtype=np.float32)
 
+    def _parse_manual_positions(self, expected_count: int) -> np.ndarray:
+        if self.manual_positions_input is None:
+            raise ValueError("Manual positions input is not initialized.")
+        raw = self.manual_positions_input.text().strip()
+        if not raw:
+            raise ValueError("Manual positions are empty. Enter comma-separated values.")
+        tokens = [part.strip() for part in raw.split(",") if part.strip()]
+        if len(tokens) != expected_count:
+            raise ValueError(
+                f"Manual positions count mismatch: expected {expected_count}, got {len(tokens)}."
+            )
+        vals = np.array([float(tok) for tok in tokens], dtype=np.float32)
+        if not np.all(np.isfinite(vals)):
+            raise ValueError("Manual positions must be finite numbers.")
+        if np.any(np.diff(vals) < 0):
+            raise ValueError("Manual positions must be non-decreasing.")
+        return vals
+
+    def _build_layered_cloud_with_positions(
+        self,
+        depth_rows: list[np.ndarray],
+        mm_per_pixel: float,
+        frame_positions_mm: np.ndarray,
+        scan_axis: str,
+    ) -> np.ndarray:
+        if scan_axis not in ("x", "y"):
+            raise ValueError("scan_axis must be 'x' or 'y'")
+        if len(depth_rows) != frame_positions_mm.shape[0]:
+            raise ValueError("Frame positions length must match number of frames.")
+        points = []
+        for depths, pos_mm in zip(depth_rows, frame_positions_mm):
+            valid = ~np.isnan(depths)
+            cols = np.where(valid)[0].astype(np.float32)
+            z = depths[valid].astype(np.float32)
+            if cols.size == 0:
+                continue
+            if scan_axis == "y":
+                x = cols * mm_per_pixel
+                y = np.full_like(x, float(pos_mm), dtype=np.float32)
+            else:
+                x = np.full_like(cols, float(pos_mm), dtype=np.float32)
+                y = cols * mm_per_pixel
+            points.append(np.column_stack([x, y, z]))
+        if not points:
+            return np.zeros((0, 3), dtype=np.float32)
+        return np.vstack(points).astype(np.float32)
+
+    def autofill_manual_positions(self) -> None:
+        if self.manual_positions_input is None:
+            return
+        try:
+            frame_count = len(self.sequence_paths)
+            if frame_count == 0:
+                self.manual_positions_input.setText("")
+                self.sequence_spacing_label.setText("Sequence spacing: load sequence first")
+                self.status_label.setText("No sequence loaded for auto-fill.")
+                return
+            step = self._f("frame_step_mm")
+            if step <= 0:
+                raise ValueError("frame_step_mm must be > 0")
+            positions = [i * step for i in range(frame_count)]
+            self.manual_positions_input.setText(", ".join(f"{v:.4f}" for v in positions))
+            self.sequence_spacing_label.setText(
+                f"Sequence spacing: manual positions auto-filled ({frame_count} frames)"
+            )
+            self.status_label.setText("Manual frame positions auto-filled from frame_step_mm.")
+        except Exception as e:
+            QMessageBox.warning(self, "Auto-fill Error", str(e))
+
     def apply_filters(self) -> None:
         try:
             self.display_depths = self._apply_profile_roi_filter(self.depths)
@@ -396,6 +479,7 @@ class LaserPrototypeQt(QMainWindow):
             return
         self.sequence_paths = sorted(paths)
         self.seq_label.setText(f"Sequence loaded: {len(self.sequence_paths)} images")
+        self.autofill_manual_positions()
         self.status_label.setText("Sequence loaded. Click Build Layered Cloud.")
 
     def build_layered_cloud(self) -> None:
@@ -403,20 +487,44 @@ class LaserPrototypeQt(QMainWindow):
             QMessageBox.warning(self, "No Sequence", "Load sequence images first.")
             return
         depth_rows = []
+        valid_indices: list[int] = []
         bad = 0
-        for p in self.sequence_paths:
+        for idx, p in enumerate(self.sequence_paths):
             try:
                 bgr = read_image(p)
                 _, _, _, d = self._process_depth(bgr)
                 depth_rows.append(d)
+                valid_indices.append(idx)
             except Exception:
                 bad += 1
         if not depth_rows:
             QMessageBox.warning(self, "No Frames", "No readable/processable frames.")
             return
-        self.layered_cloud = build_layered_cloud_from_depth_rows(
-            depth_rows, self._f("mm_per_pixel"), self._f("frame_step_mm"), self.scan_axis.currentText()
-        )
+        mode = self.sequence_spacing_mode.currentText()
+        if mode == "Manual frame positions (mm)":
+            all_positions = self._parse_manual_positions(len(self.sequence_paths))
+            positions = all_positions[np.array(valid_indices, dtype=np.int32)]
+            self.layered_cloud = self._build_layered_cloud_with_positions(
+                depth_rows,
+                self._f("mm_per_pixel"),
+                positions,
+                self.scan_axis.currentText(),
+            )
+            if positions.shape[0] > 1:
+                steps = np.diff(positions)
+                self.sequence_spacing_label.setText(
+                    "Sequence spacing: manual "
+                    f"(min step={float(np.min(steps)):.4f} mm, max step={float(np.max(steps)):.4f} mm)"
+                )
+            else:
+                self.sequence_spacing_label.setText("Sequence spacing: manual (single frame)")
+        else:
+            self.layered_cloud = build_layered_cloud_from_depth_rows(
+                depth_rows, self._f("mm_per_pixel"), self._f("frame_step_mm"), self.scan_axis.currentText()
+            )
+            self.sequence_spacing_label.setText(
+                f"Sequence spacing: uniform step {self._f('frame_step_mm'):.4f} mm"
+            )
         self.apply_filters()
         self.status_label.setText(f"Layered cloud: frames={len(depth_rows)}, unreadable={bad}, points={self.layered_cloud.shape[0]}")
 
